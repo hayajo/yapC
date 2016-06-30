@@ -1,0 +1,13 @@
+#!/bin/sh
+
+set -e
+test "$YAPC_DEBUG" && set -x
+
+clean_exec() {
+  for i in $(env | grep ^YAPC_ | cut -f1 -d=); do
+    unset "$i"
+  done
+  exec "$@"
+}
+
+clean_exec unshare --mount --uts --ipc --pid --fork --mount-proc "$@"

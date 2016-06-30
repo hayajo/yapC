@@ -1,0 +1,95 @@
+#!/bin/sh
+
+set -e
+test "$YAPC_DEBUG" && set -x
+
+: ${YAPC_CAPS:="cap_chown,cap_dac_override,cap_fsetid,cap_fowner,cap_mknod,cap_setgid,cap_setuid,cap_setfcap,cap_setpcap,cap_net_bind_service,cap_sys_chroot,cap_kill,cap_audit_write"}
+: ${YAPC_ROOT:="/"}
+
+SUBSYS="cpu,memory,pids"
+
+if [ $$ -ne 1 ]; then
+  TRAP_CMD=
+
+  export YAPC_CGROUP=
+  YAPC_CGROUP="$(basename $0)-$$"
+  cgcreate -g $SUBSYS:$YAPC_CGROUP
+  TRAP_CMD="cgdelete -g $SUBSYS:$YAPC_CGROUP;$TRAP_CMD"
+
+  trap "$TRAP_CMD" EXIT
+
+  export YAPC_WORKDIR=
+  YAPC_WORKDIR=$(mktemp -d /tmp/"$(basename $0)".$$.XXXXXXXX)
+  TRAP_CMD="rm -rf $YAPC_WORKDIR;$TRAP_CMD"
+
+  trap '' INT
+  trap "$TRAP_CMD" EXIT
+
+  (trap - INT; unshare --mount --uts --ipc --pid --fork $0 "$@")
+
+  exit 0
+fi
+
+mount --make-rprivate /
+
+for i in root upper work; do
+  mkdir $YAPC_WORKDIR/$i
+done
+mount -t overlay -o lowerdir=$YAPC_ROOT,upperdir=$YAPC_WORKDIR/upper,workdir=$YAPC_WORKDIR/work overlayfs $YAPC_WORKDIR/root
+YAPC_ROOT=$YAPC_WORKDIR/root
+
+mount -t tmpfs tmpfs $YAPC_ROOT/dev
+mkdir $YAPC_ROOT/dev/pts
+mount -t devpts -o newinstance,ptmxmode=0666,mode=620,gid=5 devpts $YAPC_ROOT/dev/pts
+ln -s /dev/pts/ptmx $YAPC_ROOT/dev/ptmx
+mkdir $YAPC_ROOT/dev/mqueue && mount -t mqueue -o nosuid,noexec,nodev mqueue $YAPC_ROOT/dev/mqueue
+mkdir $YAPC_ROOT/dev/shm && mount -t tmpfs -o mode=1777,size=65536k tmpfs $YAPC_ROOT/dev/shm
+touch $YAPC_ROOT/dev/console &&  mount --bind /dev/console $YAPC_ROOT/dev/console
+touch $YAPC_ROOT/dev/null &&  mount --bind /dev/null $YAPC_ROOT/dev/null
+touch $YAPC_ROOT/dev/zero &&  mount --bind /dev/zero $YAPC_ROOT/dev/zero
+touch $YAPC_ROOT/dev/random &&  mount --bind /dev/random $YAPC_ROOT/dev/random
+touch $YAPC_ROOT/dev/urandom &&  mount --bind /dev/urandom $YAPC_ROOT/dev/urandom
+
+mount -t proc -o rw,nosuid,nodev,noexec,relatime proc $YAPC_ROOT/proc
+mount --bind -o ro /proc/sys $YAPC_ROOT/proc/sys
+mount --bind -o ro /proc/sysrq-trigger $YAPC_ROOT/proc/sysrq-trigger
+mount --bind -o ro /proc/irq $YAPC_ROOT/proc/irq
+mount --bind -o ro /proc/bus $YAPC_ROOT/proc/bus
+
+mount -t sysfs -o ro,nosuid,noexec,nodev sysfs $YAPC_ROOT/sys
+
+for i in resolv.conf hosts hostname; do
+  cp --parents /etc/$i $YAPC_WORKDIR/upper/
+done
+
+test "$YAPC_CPU_QUOTA" && cgset -r cpu.cfs_quota_us=$YAPC_CPU_QUOTA $YAPC_CGROUP
+test "$YAPC_MEMORY_LIMIT" && cgset -r memory.limit_in_bytes=$YAPC_MEMORY_LIMIT $YAPC_CGROUP
+test "$YAPC_PIDS_MAX" && cgset -r pids.max=$YAPC_PIDS_MAX $YAPC_CGROUP
+cgclassify -g $SUBSYS:$YAPC_CGROUP $$
+
+cd $YAPC_ROOT
+mkdir .oldroot
+pivot_root . .oldroot
+cd /
+umount -l /.oldroot
+rmdir /.oldroot
+
+clean_exec() {
+  for i in $(env | grep ^YAPC_ | cut -f1 -d=); do
+    unset "$i"
+  done
+  exec "$@"
+}
+
+DROP_CAPS=$(
+  capsh \
+  --inh="$YAPC_CAPS" \
+  -- \
+  -c 'capsh --decode=$(printf "%#x" $(((~0x$(cat /proc/self/status | grep ^CapInh | cut -f2)) & 0x3FFFFFFFFF))) | cut -d= -f2'
+)
+
+clean_exec capsh \
+  --inh="${YAPC_CAPS}+ep" \
+  --drop="$DROP_CAPS" \
+  -- \
+  -c "$*"
